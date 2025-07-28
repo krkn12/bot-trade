@@ -112,12 +112,12 @@ class TradingBot:
         """Atualiza os pares de negociação com base no seletor automático de moedas"""
         if not self.usar_selecao_automatica:
             return
-            
+                
         # Verificar se é hora de atualizar os pares
         tempo_atual = time.time()
         if tempo_atual - self.ultima_atualizacao_moedas < SELECAO_INTERVALO:
             return
-            
+                
         print("🔄 Atualizando pares de negociação...")
         self.ultima_atualizacao_moedas = tempo_atual
         
@@ -127,12 +127,35 @@ class TradingBot:
         if not moedas_selecionadas:
             print("⚠️ Nenhuma moeda selecionada pelo seletor automático")
             return
-            
+        
+        # Verificar se os pares são válidos na Binance
+        async def verificar_par_valido(par):
+            try:
+                async with AsyncAPIHandler() as api:
+                    preco = await api.get_price(par)
+                    if preco and not isinstance(preco, Exception):
+                        return True
+                    print(f"⚠️ Par {par} inválido ou sem preço disponível")
+                    return False
+            except Exception as e:
+                print(f"⚠️ Erro ao verificar par {par}: {e}")
+                return False
+        
+        # Filtrar apenas pares válidos
+        loop = asyncio.get_event_loop()
+        tarefas = [verificar_par_valido(par) for par in moedas_selecionadas]
+        resultados = loop.run_until_complete(asyncio.gather(*tarefas))
+        moedas_validas = [par for par, valido in zip(moedas_selecionadas, resultados) if valido]
+        
+        if not moedas_validas:
+            print("⚠️ Nenhum par válido encontrado. Mantendo pares atuais.")
+            return
+        
         # Verificar se há mudanças nos pares
-        if set(moedas_selecionadas) == set(self.pares):
+        if set(moedas_validas) == set(self.pares):
             print("ℹ️ Pares de negociação já estão atualizados")
             return
-            
+        
         # Salvar posições abertas para não perder o rastreamento
         posicoes_abertas = {par: self.posicao_aberta.get(par, False) for par in self.pares}
         
@@ -140,16 +163,16 @@ class TradingBot:
         novos_pares = []
         removidos = []
         
-        for par in moedas_selecionadas:
+        for par in moedas_validas:
             if par not in self.pares:
                 novos_pares.append(par)
                 
         for par in self.pares:
-            if par not in moedas_selecionadas and not posicoes_abertas.get(par, False):
+            if par not in moedas_validas and not posicoes_abertas.get(par, False):
                 removidos.append(par)
         
         # Manter pares com posições abertas e adicionar novos pares selecionados
-        pares_atualizados = [par for par in self.pares if par in moedas_selecionadas or posicoes_abertas.get(par, False)]
+        pares_atualizados = [par for par in self.pares if par in moedas_validas or posicoes_abertas.get(par, False)]
         for par in novos_pares:
             if par not in pares_atualizados:
                 pares_atualizados.append(par)
@@ -183,6 +206,7 @@ class TradingBot:
         
         # Salvar estado atualizado
         self._salvar_estado()
+
 
     def _carregar_estado(self):
         """Carrega o estado do bot a partir do banco de dados."""
@@ -675,32 +699,37 @@ class TradingBot:
                             print(f"⚠️ Erro ao obter preço de {par}: {preco_atual}")
                             continue
 
+                        # Log para verificar os dados de candles
+                        print(f"📊 Dados de candles para {par}: {candles[:5] if candles else 'Nenhum dado'}")
+
                         # Atualizar histórico
                         self.atualizar_dados_mercado(par, preco_atual, dados_24h.get('quoteVolume') if dados_24h and not isinstance(dados_24h, Exception) else None)
 
-                        # Obter médias móveis
+                        # Obter médias móveis com verificação
                         medias = calcular_medias_moveis(candles) if candles and not isinstance(candles, Exception) else None
+                        if medias is None:
+                            print(f"⚠️ Não foi possível calcular médias móveis para {par}. Continuando...")
+                            continue                  
+                        
+                        preco_atual = precos.get(par)
+                        dados_24h = tickers_24h.get(par)
+                        candles = candles_data.get(par)
 
-                        # Verificar stop loss / take profit primeiro
-                        if self.verificar_stop_loss_take_profit(preco_atual, par):
+                        if not preco_atual or isinstance(preco_atual, Exception):
+                            print(f"⚠️ Erro ao obter preço de {par}: {preco_atual}")
                             continue
 
-                        # Selecionar estratégia para o par
-                        estrategia = self.estrategias.get(par, self.analisar_mercado)
-                        decisao, motivo = estrategia(preco_atual, dados_24h, medias, par=par)
+                        # Adicionar log para inspecionar candles
+                        print(f"📊 Dados de candles para {par}: {candles[:5] if candles else 'Nenhum dado'}")
 
-                        # Exibir status
-                        self.exibir_status(par, preco_atual, dados_24h, medias, decisao, motivo)
+                        # Atualizar histórico
+                        self.atualizar_dados_mercado(par, preco_atual, dados_24h.get('quoteVolume') if dados_24h and not isinstance(dados_24h, Exception) else None)
 
-                        # Executar trades
-                        modo_recuperacao = self.lucro_hoje < -0.01
-                        max_trades = MAX_TRADES_DIA + 2 if modo_recuperacao else MAX_TRADES_DIA
-
-                        if decisao == "COMPRA" and not self.posicao_aberta.get(par, False) and self.trades_hoje < max_trades and self.capital >= 2.0:
-                            self.executar_compra(preco_atual, par, motivo)
-                        elif decisao == "VENDA" and self.posicao_aberta.get(par, False):
-                            self.executar_venda(preco_atual, par, motivo)
-
+                        # Obter médias móveis com verificação
+                        medias = calcular_medias_moveis(candles) if candles and not isinstance(candles, Exception) else None
+                        if medias is None:
+                            print(f"⚠️ Não foi possível calcular médias móveis para {par}. Continuando...")
+                            continue
                     await asyncio.sleep(INTERVALO)
 
                 except KeyboardInterrupt:
