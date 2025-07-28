@@ -1,8 +1,10 @@
 # Execução de ordens (compra, venda, simulação, etc.)
 
+from config import MAX_TRADES_DIA, TAXA_BINANCE, STOP_LOSS_PCT, RELACAO_RISCO_RETORNO, MODO_SIMULACAO, CAPITAL_INICIAL
+
 def executar_compra(bot, preco_atual):
     """Executa ordem de compra (real ou simulação) com taxa e slippage"""
-    if bot.posicao_aberta or bot.trades_hoje >= bot.MAX_TRADES_DIA:
+    if bot.posicao_aberta or bot.trades_hoje >= MAX_TRADES_DIA:
         return False
 
     valor_bruto = bot.capital * 0.8
@@ -15,10 +17,10 @@ def executar_compra(bot, preco_atual):
         return False
 
     preco_ajustado = preco_atual * (1 + bot.slippage)
-    taxa_compra = valor_bruto * bot.TAXA_BINANCE / 2
+    taxa_compra = valor_bruto * TAXA_BINANCE / 2
     valor_liquido = valor_bruto - taxa_compra
 
-    if bot.MODO_SIMULACAO:
+    if MODO_SIMULACAO:
         print("\n🟡 [SIMULAÇÃO] ORDEM DE COMPRA SIMULADA")
     else:
         print("\n🟢 ═══ ORDEM DE COMPRA EXECUTADA ═══")
@@ -29,9 +31,9 @@ def executar_compra(bot, preco_atual):
     bot.trades_hoje += 1
     bot.capital -= valor_bruto
 
-    take_profit_pct = bot.STOP_LOSS_PCT * bot.RELACAO_RISCO_RETORNO
+    take_profit_pct = STOP_LOSS_PCT * RELACAO_RISCO_RETORNO
     take_profit = preco_ajustado * (1 + take_profit_pct)
-    stop_loss = preco_ajustado * (1 - bot.STOP_LOSS_PCT)
+    stop_loss = preco_ajustado * (1 - STOP_LOSS_PCT)
 
     print(f"💰 Preço (com slippage): ${preco_ajustado:.2f}")
     print(f"💵 Valor Bruto: ${valor_bruto:.2f}")
@@ -39,16 +41,16 @@ def executar_compra(bot, preco_atual):
     print(f"💰 Valor Líquido: ${valor_liquido:.2f}")
     print(f"₿ Quantidade: {bot.quantidade_btc:.6f} BTC")
     print(f"💰 Capital Restante: ${bot.capital:.2f}")
-    print(f"🛑 Stop Loss: ${stop_loss:.2f} (-{bot.STOP_LOSS_PCT*100:.1f}%)")
+    print(f"🛑 Stop Loss: ${stop_loss:.2f} (-{STOP_LOSS_PCT*100:.1f}%)")
     print(f"🎯 Take Profit: ${take_profit:.2f} (+{take_profit_pct*100:.1f}%)")
-    print(f"📊 Relação Risco/Retorno: {bot.RELACAO_RISCO_RETORNO:.2f}x")
-    print(f"⚙️ Slippage: {bot.slippage*100:.2f}% | Taxa total: {bot.TAXA_BINANCE*100:.2f}%")
+    print(f"📊 Relação Risco/Retorno: {RELACAO_RISCO_RETORNO:.2f}x")
+    print(f"⚙️ Slippage: {bot.slippage*100:.2f}% | Taxa total: {TAXA_BINANCE*100:.2f}%")
 
     bot.log_manager.registrar_trade(
-        "COMPRA_SIMULADA" if bot.MODO_SIMULACAO else "COMPRA",
+        "COMPRA_SIMULADA" if MODO_SIMULACAO else "COMPRA",
         preco_ajustado, valor_bruto, bot.capital + valor_bruto,
-        bot.lucro_hoje, (bot.lucro_hoje/bot.CAPITAL_INICIAL)*100,
-        f"SL: ${stop_loss:.2f} | TP: ${take_profit:.2f} | Risco/Retorno: {bot.RELACAO_RISCO_RETORNO:.2f}x | Taxa: ${taxa_compra:.2f} | Slippage: {bot.slippage*100:.2f}% | Restante: ${bot.capital:.2f}"
+        bot.lucro_hoje, (bot.lucro_hoje/CAPITAL_INICIAL)*100,
+        f"SL: ${stop_loss:.2f} | TP: ${take_profit:.2f} | Risco/Retorno: {RELACAO_RISCO_RETORNO:.2f}x | Taxa: ${taxa_compra:.2f} | Slippage: {bot.slippage*100:.2f}% | Restante: ${bot.capital:.2f}"
     )
 
     bot.log_trades.append({
@@ -73,12 +75,12 @@ def executar_venda(bot, preco_atual):
     preco_ajustado = preco_atual * (1 - bot.slippage)
     valor_atual = bot.quantidade_btc * preco_ajustado
     valor_investido = bot.quantidade_btc * bot.preco_entrada
-    taxa_venda = valor_atual * bot.TAXA_BINANCE / 2
+    taxa_venda = valor_atual * TAXA_BINANCE / 2
     valor_liquido = valor_atual - taxa_venda
     lucro_bruto = valor_atual - valor_investido
-    lucro_liquido = valor_liquido - (valor_investido - (valor_investido * bot.TAXA_BINANCE / 2))
+    lucro_liquido = valor_liquido - (valor_investido - (valor_investido * TAXA_BINANCE / 2))
 
-    if bot.MODO_SIMULACAO:
+    if MODO_SIMULACAO:
         print("\n🟡 [SIMULAÇÃO] ORDEM DE VENDA SIMULADA")
     else:
         print("\n🔴 ═══ ORDEM DE VENDA EXECUTADA ═══")
@@ -107,12 +109,12 @@ def executar_venda(bot, preco_atual):
 
     print(f"💰 Capital Total: ${bot.capital:.2f}")
     print(f"📈 Lucro do Dia: ${bot.lucro_hoje:.2f}")
-    print(f"⚙️ Slippage: {bot.slippage*100:.2f}% | Taxa total: {bot.TAXA_BINANCE*100:.2f}%")
+    print(f"⚙️ Slippage: {bot.slippage*100:.2f}% | Taxa total: {TAXA_BINANCE*100:.2f}%")
 
     bot.log_manager.registrar_trade(
-        "VENDA_SIMULADA" if bot.MODO_SIMULACAO else "VENDA",
+        "VENDA_SIMULADA" if MODO_SIMULACAO else "VENDA",
         preco_ajustado, valor_atual, bot.capital,
-        bot.lucro_hoje, (bot.lucro_hoje/bot.CAPITAL_INICIAL)*100,
+        bot.lucro_hoje, (bot.lucro_hoje/CAPITAL_INICIAL)*100,
         f"P&L: ${lucro_liquido:.2f} | Taxa: ${taxa_venda:.2f} | Slippage: {bot.slippage*100:.2f}% | Compra: ${bot.preco_entrada:.2f}"
     )
 

@@ -3,88 +3,236 @@ import json
 from datetime import datetime, timedelta
 from binance_api import get_price, get_daily_candles, get_24h_ticker
 from core.estrategias import calcular_rsi, calcular_macd, calcular_ema, calcular_medias_moveis
+from core.database_manager import DatabaseManager
+from core.async_api_handler import AsyncAPIHandler
 from core.execucao import executar_compra, executar_venda
-from config import INTERVALO, PAR, CAPITAL_INICIAL, STOP_LOSS_PCT, TAKE_PROFIT_PCT, MAX_TRADES_DIA, MODO_SIMULACAO, RELACAO_RISCO_RETORNO, TAXA_BINANCE
-from capital_log import CapitalLog
+from config import INTERVALO, PAR, CAPITAL_INICIAL, STOP_LOSS_PCT, TAKE_PROFIT_PCT, MAX_TRADES_DIA, MODO_SIMULACAO, RELACAO_RISCO_RETORNO, TAXA_BINANCE, USAR_ML, ML_CONFIANCA_MIN, ML_TREINO_INTERVALO, ML_MODELOS_DIR, ML_FEATURES, ML_TIMEFRAMES, ML_JANELA_PREVISAO, USAR_SELECAO_AUTOMATICA, SELECAO_INTERVALO, SELECAO_MAX_MOEDAS, SELECAO_DIAS_NOVAS, SELECAO_VOLUME_MIN, SELECAO_VOLATILIDADE_MIN, MOEDA_BASE
+from core.ml_predictor import MLPredictor
+from core.coin_selector import CoinSelector
 
 import winsound
+import asyncio
 
 import os
 
 class TradingBot:
-    STATE_FILE = "bot_state.json"
 
-    def __init__(self, pares=None, estrategias=None):
-        self.log_manager = CapitalLog()
+    def __init__(self, pares=None, estrategias=None, capital_inicial=CAPITAL_INICIAL, moeda_base=MOEDA_BASE, usar_ml=USAR_ML, usar_selecao_automatica=USAR_SELECAO_AUTOMATICA):
+        self.db_manager = DatabaseManager()
         self.ultima_decisao = ""
         self.trades_ganhos = 0
         self.trades_perdidos = 0
         self.slippage = 0.0005  # 0.05% slippage padrão
         self.log_trades = []
+        self.capital_inicial = capital_inicial
+        self.moeda_base = moeda_base
         self.pares = pares if pares else [PAR]
         # Parâmetro adaptativo do RSI
         self.rsi_periodo = 14
+
+        # Inicializar configurações principais ANTES de carregar o estado
+        self.usar_ml = usar_ml
+        self.usar_selecao_automatica = usar_selecao_automatica
+
         self._ajustar_rsi_periodo()
+        self._carregar_estado()
         # Dicionário: par -> função de estratégia
         self.estrategias = estrategias if estrategias else {par: self.analisar_mercado for par in self.pares}
         self.historico_precos = {par: [] for par in self.pares}
-        self._carregar_estado()
+        self.historico_volumes = {par: [] for par in self.pares}
+        self.intervalo_treino_ml = ML_TREINO_INTERVALO
+        
+        # --- Variáveis de estado multi-ativo ---
+        self.posicao_aberta = {par: False for par in self.pares}
+        self.precos_entrada = {par: 0 for par in self.pares}
+        self.quantidades_compradas = {par: 0 for par in self.pares}
+        self.stop_loss = {par: 0 for par in self.pares}
+        self.take_profit = {par: 0 for par in self.pares}
+        
+        # Inicializar preditor de ML
+        if self.usar_ml:
+            try:
+                self.ml_predictor = MLPredictor(modelos_dir=ML_MODELOS_DIR, 
+                                               features=ML_FEATURES, 
+                                               timeframes=ML_TIMEFRAMES, 
+                                               janela_previsao=ML_JANELA_PREVISAO)
+                print("✅ Preditor de Machine Learning inicializado")
+                print(f"📊 Features: {', '.join(ML_FEATURES)}")
+                print(f"⏱️ Timeframes: {', '.join(ML_TIMEFRAMES)}")
+                print(f"🎯 Confiança mínima: {ML_CONFIANCA_MIN*100:.1f}%")
+            except Exception as e:
+                print(f"⚠️ Erro ao inicializar ML Predictor: {e}")
+                self.usar_ml = False
+        
+        # Inicializar seletor automático de moedas
+        if self.usar_selecao_automatica:
+            try:
+                self.coin_selector = CoinSelector()
+                # Configurar o seletor com os parâmetros do config.py
+                self.coin_selector.set_scan_interval(SELECAO_INTERVALO)
+                self.coin_selector.set_max_coins(SELECAO_MAX_MOEDAS)
+                self.coin_selector.set_volume_threshold(SELECAO_VOLUME_MIN)
+                self.coin_selector.set_volatility_threshold(SELECAO_VOLATILIDADE_MIN)
+                # Definir a moeda base para o seletor
+                self.coin_selector.quote_asset = self.moeda_base
+                print("✅ Seletor automático de moedas inicializado")
+                print(f"🔍 Intervalo de busca: {SELECAO_INTERVALO/3600:.1f} horas")
+                print(f"🔢 Máximo de moedas: {SELECAO_MAX_MOEDAS}")
+                print(f"📊 Volume mínimo: ${SELECAO_VOLUME_MIN:,.2f}")
+                print(f"📈 Volatilidade mínima: {SELECAO_VOLATILIDADE_MIN:.1f}%")
+                print(f"💱 Moeda base: {self.moeda_base}")
+                
+                # Atualizar pares iniciais se necessário
+                self._atualizar_pares_negociacao()
+            except Exception as e:
+                print(f"⚠️ Erro ao inicializar seletor automático de moedas: {e}")
+                self.usar_selecao_automatica = False
+        
         print("🟢 BOT TRADING PROFISSIONAL INICIADO")
         print(f"💰 Capital Inicial: ${self.capital:.2f}")
         print(f"🎯 Meta: {MAX_TRADES_DIA} trades/dia máx")
         print(f"📈 Pares monitorados: {', '.join(self.pares)}")
+        print(f"🧠 Machine Learning: {'ATIVADO' if self.usar_ml else 'DESATIVADO'}")
         print("═" * 50)
 
     def _ajustar_rsi_periodo(self):
-        # Ajusta o período do RSI conforme o desempenho do dia anterior
-        resumo = self.log_manager.get_resumo_hoje()
-        lucro = resumo.get('lucro', 0)
-        if lucro < 0:
-            self.rsi_periodo = min(20, self.rsi_periodo + 2)  # Fica mais conservador
-        elif lucro > 0:
-            self.rsi_periodo = max(8, self.rsi_periodo - 2)   # Fica mais agressivo
+        try:
+            # Ajusta o período do RSI conforme o desempenho do dia anterior
+            stats = self.db_manager.get_trade_statistics(days=1)
+            lucro_hoje = stats.get('net_profit') or 0 # Garante que None se torne 0
+            if lucro_hoje < 0:
+                self.rsi_periodo = min(20, self.rsi_periodo + 2)  # Fica mais conservador
+            elif lucro_hoje > 0:
+                self.rsi_periodo = max(8, self.rsi_periodo - 2)   # Fica mais agressivo
+        except Exception as e:
+            print(f"⚠️ Erro ao ajustar RSI: {e}")
+            self.db_manager.log("ERROR", "TradingBot", f"Erro ao ajustar RSI: {e}")
+            
+    def _atualizar_pares_negociacao(self):
+        """Atualiza os pares de negociação com base no seletor automático de moedas"""
+        if not self.usar_selecao_automatica:
+            return
+            
+        # Verificar se é hora de atualizar os pares
+        tempo_atual = time.time()
+        if tempo_atual - self.ultima_atualizacao_moedas < SELECAO_INTERVALO:
+            return
+            
+        print("🔄 Atualizando pares de negociação...")
+        self.ultima_atualizacao_moedas = tempo_atual
+        
+        # Obter moedas selecionadas pelo seletor
+        moedas_selecionadas = self.coin_selector.get_selected_coins()
+        
+        if not moedas_selecionadas:
+            print("⚠️ Nenhuma moeda selecionada pelo seletor automático")
+            return
+            
+        # Verificar se há mudanças nos pares
+        if set(moedas_selecionadas) == set(self.pares):
+            print("ℹ️ Pares de negociação já estão atualizados")
+            return
+            
+        # Salvar posições abertas para não perder o rastreamento
+        posicoes_abertas = {par: self.posicao_aberta.get(par, False) for par in self.pares}
+        
+        # Atualizar pares
+        novos_pares = []
+        removidos = []
+        
+        for par in moedas_selecionadas:
+            if par not in self.pares:
+                novos_pares.append(par)
+                
+        for par in self.pares:
+            if par not in moedas_selecionadas and not posicoes_abertas.get(par, False):
+                removidos.append(par)
+        
+        # Manter pares com posições abertas e adicionar novos pares selecionados
+        pares_atualizados = [par for par in self.pares if par in moedas_selecionadas or posicoes_abertas.get(par, False)]
+        for par in novos_pares:
+            if par not in pares_atualizados:
+                pares_atualizados.append(par)
+        
+        # Atualizar a lista de pares
+        self.pares = pares_atualizados
+        
+        # Atualizar estratégias para os novos pares
+        self.estrategias = {par: self.analisar_mercado for par in self.pares}
+        
+        # Inicializar histórico para novos pares
+        for par in novos_pares:
+            self.historico_precos[par] = []
+            self.historico_volumes[par] = []
+            self.posicao_aberta[par] = posicoes_abertas.get(par, False)
+            self.precos_entrada[par] = 0
+            self.stop_loss[par] = 0
+            self.take_profit[par] = 0
+        
+        # Limpar histórico de pares removidos para economizar memória
+        for par in removidos:
+            if par in self.historico_precos:
+                del self.historico_precos[par]
+            if par in self.historico_volumes:
+                del self.historico_volumes[par]
+        
+        print(f"✅ Pares de negociação atualizados: {len(self.pares)} pares ativos")
+        print(f"📈 Novos pares: {', '.join(novos_pares) if novos_pares else 'Nenhum'}")
+        print(f"📉 Pares removidos: {', '.join(removidos) if removidos else 'Nenhum'}")
+        print(f"🔍 Pares atuais: {', '.join(self.pares)}")
+        
+        # Salvar estado atualizado
+        self._salvar_estado()
 
     def _carregar_estado(self):
-        if os.path.exists(self.STATE_FILE):
-            try:
-                with open(self.STATE_FILE, 'r') as f:
-                    state = json.load(f)
-                self.capital = state.get('capital', CAPITAL_INICIAL)
-                self.posicao_aberta = state.get('posicao_aberta', None)
-                self.preco_entrada = state.get('preco_entrada', 0)
-                self.quantidade_btc = state.get('quantidade_btc', 0)
-                self.trades_hoje = state.get('trades_hoje', 0)
-                self.lucro_hoje = state.get('lucro_hoje', 0.0)
-            except Exception as e:
-                print(f"⚠️ Erro ao carregar estado salvo: {e}")
-                self.capital = CAPITAL_INICIAL
-                self.posicao_aberta = None
-                self.preco_entrada = 0
-                self.quantidade_btc = 0
-                self.trades_hoje = 0
-                self.lucro_hoje = 0.0
-        else:
+        """Carrega o estado do bot a partir do banco de dados."""
+        try:
+            self.capital = self.db_manager.get_config('capital', CAPITAL_INICIAL)
+            self.trades_hoje = self.db_manager.get_config('trades_hoje', 0)
+            self.lucro_hoje = self.db_manager.get_config('lucro_hoje', 0.0)
+            self.posicao_aberta = self.db_manager.get_config('posicao_aberta', {par: False for par in self.pares})
+            self.precos_entrada = self.db_manager.get_config('precos_entrada', {par: 0 for par in self.pares})
+            self.quantidades_compradas = self.db_manager.get_config('quantidades_compradas', {par: 0 for par in self.pares})
+            self.usar_ml = self.db_manager.get_config('usar_ml', self.usar_ml)
+            self.ultimo_treino_ml = self.db_manager.get_config('ultimo_treino_ml', 0)
+            self.rsi_periodo = self.db_manager.get_config('rsi_periodo', 14)
+            self.usar_selecao_automatica = self.db_manager.get_config('usar_selecao_automatica', self.usar_selecao_automatica)
+            self.ultima_atualizacao_moedas = self.db_manager.get_config('ultima_atualizacao_moedas', 0)
+            
+            pares_salvos = self.db_manager.get_config('pares', self.pares)
+            if pares_salvos:
+                self.pares = pares_salvos
+                self.estrategias = {par: self.analisar_mercado for par in self.pares}
+
+            print("✅ Estado do bot carregado do banco de dados.")
+        except Exception as e:
+            print(f"⚠️ Erro ao carregar estado do DB: {e}. Usando valores padrão.")
+            self.db_manager.log("ERROR", "TradingBot", f"Falha ao carregar estado: {e}")
+            # Definir valores padrão em caso de falha
             self.capital = CAPITAL_INICIAL
-            self.posicao_aberta = None
-            self.preco_entrada = 0
-            self.quantidade_btc = 0
             self.trades_hoje = 0
+            self.posicao_aberta = {par: False for par in self.pares}
             self.lucro_hoje = 0.0
 
     def _salvar_estado(self):
-        state = {
-            'capital': self.capital,
-            'posicao_aberta': self.posicao_aberta,
-            'preco_entrada': self.preco_entrada,
-            'quantidade_btc': self.quantidade_btc,
-            'trades_hoje': self.trades_hoje,
-            'lucro_hoje': self.lucro_hoje
-        }
+        """Salva o estado atual do bot no banco de dados."""
         try:
-            with open(self.STATE_FILE, 'w') as f:
-                json.dump(state, f)
+            self.db_manager.set_config('capital', self.capital)
+            self.db_manager.set_config('trades_hoje', self.trades_hoje)
+            self.db_manager.set_config('lucro_hoje', self.lucro_hoje)
+            self.db_manager.set_config('posicao_aberta', self.posicao_aberta)
+            self.db_manager.set_config('precos_entrada', self.precos_entrada)
+            self.db_manager.set_config('quantidades_compradas', self.quantidades_compradas)
+            self.db_manager.set_config('usar_ml', self.usar_ml)
+            self.db_manager.set_config('ultimo_treino_ml', self.ultimo_treino_ml)
+            self.db_manager.set_config('rsi_periodo', self.rsi_periodo)
+            self.db_manager.set_config('usar_selecao_automatica', self.usar_selecao_automatica)
+            self.db_manager.set_config('ultima_atualizacao_moedas', self.ultima_atualizacao_moedas)
+            self.db_manager.set_config('pares', self.pares)
         except Exception as e:
-            print(f"⚠️ Erro ao salvar estado: {e}")
+            print(f"⚠️ Erro ao salvar estado no DB: {e}")
+            self.db_manager.log("ERROR", "TradingBot", f"Falha ao salvar estado: {e}")
+
     
     def calcular_indicadores(self, precos):
         """Calcula todos os indicadores técnicos (RSI adaptativo)"""
@@ -103,6 +251,49 @@ class TradingBot:
             'rsi_periodo': self.rsi_periodo
         }
     
+    def treinar_modelo_ml(self, par, force_retrain=False):
+        """Treina o modelo de ML para um par específico"""
+        if not self.usar_ml or not hasattr(self, 'ml_predictor'):
+            return {"error": "ML não está ativado"}
+        
+        if len(self.historico_precos[par]) < 200:
+            return {"error": "Dados históricos insuficientes para treinar modelo"}
+        
+        volumes = self.historico_volumes.get(par, None)
+        if volumes and len(volumes) != len(self.historico_precos[par]):
+            volumes = None
+        
+        try:
+            # Criar features adicionais para o treinamento
+            features_extras = {}
+            
+            # Adicionar indicadores técnicos como features
+            indicadores = self.calcular_indicadores(self.historico_precos[par])
+            if indicadores:
+                for indicador, valor in indicadores.items():
+                    if isinstance(valor, (int, float)):
+                        features_extras[indicador] = valor
+            
+            # Treinar o modelo com as features configuradas
+            resultado = self.ml_predictor.train(
+                par, 
+                self.historico_precos[par], 
+                volumes, 
+                force_retrain=force_retrain,
+                features_extras=features_extras
+            )
+            
+            if resultado.get('retrained', False):
+                print(f"✅ Modelo para {par} treinado com acurácia de {resultado.get('accuracy', 0):.2%}")
+                if 'feature_importance' in resultado:
+                    print("📊 Importância das features:")
+                    for feature, importance in resultado['feature_importance'].items():
+                        print(f"   - {feature}: {importance:.2%}")
+            return resultado
+        except Exception as e:
+            print(f"⚠️ Erro ao treinar modelo para {par}: {e}")
+            return {"error": str(e)}
+    
     def analisar_mercado(self, preco_atual, dados_24h, medias, par=None):
         """Análise profissional do mercado"""
         # Suporte para multiativo: usa histórico correto
@@ -113,8 +304,33 @@ class TradingBot:
         if not indicadores:
             return "AGUARDAR", "Indicadores insuficientes"
         
+        # Usar ML para previsão se disponível
+        ml_signal = "NEUTRO"
+        ml_confidence = 0.0
+        
+        if self.usar_ml and hasattr(self, 'ml_predictor') and len(historico) >= 100:
+            try:
+                # Treinar modelo se necessário
+                if par not in self.ml_predictor.models:
+                    self.treinar_modelo_ml(par)
+                
+                # Fazer previsão
+                volumes = self.historico_volumes.get(par, None)
+                if volumes and len(volumes) != len(historico):
+                    volumes = None
+                    
+                prediction = self.ml_predictor.predict(par, historico, volumes)
+                
+                if 'error' not in prediction:
+                    ml_signal = prediction.get('signal', 'NEUTRO')
+                    ml_confidence = prediction.get('confidence', 0.0)
+                    
+                    print(f"🧠 ML Previsão: {ml_signal} (confiança: {ml_confidence:.2%})")
+            except Exception as e:
+                print(f"⚠️ Erro na previsão ML: {e}")
+        
         # Se já tem posição aberta, só analisa para venda
-        if self.posicao_aberta:
+        if self.posicao_aberta.get(par, False):
             condicoes_venda = 0
             motivos_venda = []
             
@@ -124,6 +340,11 @@ class TradingBot:
             
             if modo_recuperacao:
                 motivos_venda.append("MODO RECUPERAÇÃO - Aguardando lucro maior")
+            
+            # Adicionar sinal ML se disponível
+            if ml_signal == "VENDA" and ml_confidence > 0.7:
+                condicoes_venda += 2
+                motivos_venda.append(f"ML recomenda venda (confiança: {ml_confidence:.2%})")
             
             # RSI overbought (mais conservador em modo recuperação)
             if modo_recuperacao:
@@ -170,6 +391,11 @@ class TradingBot:
         else:
             condicoes_compra = 0
             motivos_compra = []
+            
+            # Adicionar sinal ML se disponível
+            if ml_signal == "COMPRA" and ml_confidence > 0.7:
+                condicoes_compra += 2
+                motivos_compra.append(f"ML recomenda compra (confiança: {ml_confidence:.2%})")
             
             # ESTRATÉGIA ANTI-PERDA: Evitar taxas desnecessárias
             modo_recuperacao = self.lucro_hoje < -0.01
@@ -262,58 +488,104 @@ class TradingBot:
             else:
                 status = "RECUPERAÇÃO" if modo_recuperacao else "NORMAL"
                 return "AGUARDAR", f"Aguardando entrada {status} (C:{condicoes_compra}/{limite_condicoes})"
-    
-    def executar_compra(self, preco_atual):
-        return executar_compra(self, preco_atual)
-    
-    def executar_venda(self, preco_atual):
-        return executar_venda(self, preco_atual)
-    
-    def verificar_stop_loss_take_profit(self, preco_atual):
-        """Verifica se deve fechar posição por SL ou TP"""
-        if not self.posicao_aberta:
+
+    def executar_compra(self, preco_atual, par, motivo=""):
+        resultado = executar_compra(self, preco_atual, par)
+        if resultado:
+            trade_data = {
+                'symbol': par,
+                'position_type': 'LONG',
+                'entry_price': self.precos_entrada.get(par, 0),
+                'quantity': self.quantidades_compradas.get(par, 0),
+                'entry_time': datetime.now(),
+                'stop_loss': self.stop_loss.get(par, 0),
+                'take_profit': self.take_profit.get(par, 0),
+                'strategy_used': 'analisar_mercado',
+                'confidence': motivo.count('ML recomenda'), # Exemplo simples de confiança
+                'is_simulation': MODO_SIMULACAO,
+                'notes': motivo
+            }
+            self.db_manager.save_trade(trade_data)
+        return resultado
+
+    def executar_venda(self, preco_atual, par, motivo=""):
+        preco_entrada = self.precos_entrada.get(par, 0)
+        quantidade = self.quantidades_compradas.get(par, 0)
+        resultado = executar_venda(self, preco_atual, par)
+        if resultado:
+            pnl = (preco_atual - preco_entrada) * quantidade if preco_entrada > 0 else 0
+            pnl_pct = (pnl / (preco_entrada * quantidade)) * 100 if preco_entrada > 0 and quantidade > 0 else 0
+            
+            trade_data = {
+                'symbol': par,
+                'exit_price': preco_atual,
+                'pnl': pnl,
+                'pnl_pct': pnl_pct,
+                'exit_time': datetime.now(),
+                'exit_reason': motivo
+            }
+            # Aqui precisaríamos de uma forma de atualizar o trade aberto, não criar um novo.
+            # Isso será melhorado com o PortfolioManager. Por agora, vamos logar um evento.
+            self.db_manager.log("INFO", "TradingBot", f"Venda executada para {par} com PnL de ${pnl:.2f}. Motivo: {motivo}")
+        return resultado
+
+    def verificar_stop_loss_take_profit(self, preco_atual, par):
+        """Verifica se deve fechar posição por SL ou TP para um par específico"""
+        if not self.posicao_aberta.get(par, False):
             return False
         
-
+        # Obter preço de entrada para o par específico
+        preco_entrada = self.precos_entrada.get(par, 0)
+        if preco_entrada <= 0:
+            return False
+            
         take_profit_pct = STOP_LOSS_PCT * RELACAO_RISCO_RETORNO
-        stop_loss = self.preco_entrada * (1 - STOP_LOSS_PCT)
-        take_profit = self.preco_entrada * (1 + take_profit_pct)
+        stop_loss = preco_entrada * (1 - STOP_LOSS_PCT)
+        take_profit = preco_entrada * (1 + take_profit_pct)
         
         if preco_atual <= stop_loss:
-            print(f"\n🛑 STOP LOSS ATIVADO! Preço: ${preco_atual:.2f} <= ${stop_loss:.2f}")
-            self.executar_venda(preco_atual)
+            print(f"\n🛑 STOP LOSS ATIVADO para {par}! Preço: ${preco_atual:.2f} <= ${stop_loss:.2f}")
+            self.executar_venda(preco_atual, par, motivo="STOP_LOSS")
             self._salvar_estado()
             return True
         elif preco_atual >= take_profit:
-            print(f"\n🎯 TAKE PROFIT ATIVADO! Preço: ${preco_atual:.2f} >= ${take_profit:.2f}")
-            self.executar_venda(preco_atual)
+            print(f"\n🎯 TAKE PROFIT ATIVADO para {par}! Preço: ${preco_atual:.2f} >= ${take_profit:.2f}")
+            self.executar_venda(preco_atual, par, motivo="TAKE_PROFIT")
             self._salvar_estado()
             return True
         
         return False
     
-    def exibir_status(self, preco_atual, dados_24h, medias, decisao, motivo):
+    def exibir_status(self, par, preco_atual, dados_24h, medias, decisao, motivo):
         """Exibe status atual do bot"""
-        print(f"\n📈 {PAR} = ${preco_atual:.2f}")
+        preco_str = f"${preco_atual:.2f}" if preco_atual is not None else "Preço indisponível"
+        print(f"\n📈 {par} = {preco_str}")
 
         if dados_24h:
-            print(f"📊 Volume 24h: ${dados_24h['quoteVolume']:,.0f} USDT")
-            print(f"📈 24h: {dados_24h['priceChangePercent']:+.2f}%")
+            volume_str = f"${dados_24h['quoteVolume']:,.0f}" if dados_24h.get('quoteVolume') is not None else "Volume indisponível"
+            change_str = f"{dados_24h['priceChangePercent']:+.2f}%" if dados_24h.get('priceChangePercent') is not None else "Variação indisponível"
+            print(f"📊 Volume 24h: {volume_str} USDT")
+            print(f"📈 24h: {change_str}")
 
         if medias:
-            print(f"📅 MA7: ${medias['MA7']:.2f} | MA25: ${medias['MA25']:.2f} | MA99: ${medias['MA99']:.2f}")
+            ma7_str = f"${medias['MA7']:.2f}" if medias.get('MA7') is not None else "N/A"
+            ma25_str = f"${medias['MA25']:.2f}" if medias.get('MA25') is not None else "N/A"
+            ma99_str = f"${medias['MA99']:.2f}" if medias.get('MA99') is not None else "N/A"
+            print(f"📅 MA7: {ma7_str} | MA25: {ma25_str} | MA99: {ma99_str}")
 
         # Status da posição
-        if self.posicao_aberta:
-            valor_investido = self.quantidade_btc * self.preco_entrada  # Valor em dólares investido
-            valor_atual = self.quantidade_btc * preco_atual  # Valor atual em dólares
+        if self.posicao_aberta.get(par, False):
+            quantidade = self.quantidades_compradas.get(par, 0)
+            preco_entrada = self.precos_entrada.get(par, 0)
+            valor_investido = quantidade * preco_entrada
+            valor_atual = quantidade * preco_atual
             pnl = valor_atual - valor_investido  # Lucro/perda em dólares
-            pnl_pct = (preco_atual - self.preco_entrada) / self.preco_entrada * 100
+            pnl_pct = (pnl / valor_investido) * 100 if valor_investido > 0 else 0
 
-            print(f"💹 POSIÇÃO ABERTA: {self.quantidade_btc:.6f} BTC @ ${self.preco_entrada:.2f}")
+            print(f"💹 POSIÇÃO ABERTA: {quantidade:.6f} {par.replace(self.moeda_base, '')} @ ${preco_entrada:.2f}")
             print(f"💰 Valor Investido: ${valor_investido:.2f} | Valor Atual: ${valor_atual:.2f}")
             if pnl > 0:
-                print(f"🟢 P&L: +${pnl:.2f} (+{pnl_pct:.2f}%)")
+                print(f"🟢 P&L: +${pnl:.2f} ({pnl_pct:+.2f}%)")
             else:
                 print(f"🔴 P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
         else:
@@ -345,86 +617,115 @@ class TradingBot:
 
         print(f"{status_capital}{status_modo} | Lucro hoje: ${self.lucro_hoje:.2f}")
     
-    def run(self):
+    def atualizar_dados_mercado(self, par, preco_atual, volume_24h=None):
+        """Atualiza os dados de mercado com o preço atual e volume"""
+        self.historico_precos[par].append(preco_atual)
+        
+        # Atualizar histórico de volumes se disponível (para ML)
+        if volume_24h is not None and par in self.historico_volumes:
+            self.historico_volumes[par].append(volume_24h)
+            # Manter o mesmo tamanho que o histórico de preços
+            if len(self.historico_volumes[par]) > len(self.historico_precos[par]):
+                self.historico_volumes[par] = self.historico_volumes[par][-len(self.historico_precos[par]):]
+        
+        # Manter apenas os últimos 500 preços para ML (mais dados para treinamento)
+        if len(self.historico_precos[par]) > 500:
+            self.historico_precos[par] = self.historico_precos[par][-500:]
+            if par in self.historico_volumes and len(self.historico_volumes[par]) > 0:
+                self.historico_volumes[par] = self.historico_volumes[par][-500:]
+        
+        # Verificar se é hora de treinar o modelo ML
+        if self.usar_ml and hasattr(self, 'ml_predictor'):
+            tempo_atual = time.time()
+            if tempo_atual - self.ultimo_treino_ml > self.intervalo_treino_ml and len(self.historico_precos[par]) >= 200:
+                print(f"🧠 Treinando modelo ML para {par}...")
+                self.treinar_modelo_ml(par)
+                self.ultimo_treino_ml = tempo_atual
+                
+    async def run(self):
         """Loop principal do bot - multiativo e multiestratégia"""
         import requests
-        while True:
-            try:
-                for par in self.pares:
-                    preco_atual = get_price(par)
-                    dados_24h = get_24h_ticker(par)
+        async with AsyncAPIHandler() as api:
+            while True:
+                try:
+                    # Atualizar pares de negociação se a seleção automática estiver ativada
+                    if self.usar_selecao_automatica:
+                        self._atualizar_pares_negociacao()
 
-                    if not preco_atual:
-                        print(f"⚠️ Erro ao obter preço de {par}")
-                        self.log_manager.registrar_trade(
-                            "ERRO", 0, 0, self.capital, self.lucro_hoje, (self.lucro_hoje/self.CAPITAL_INICIAL)*100,
-                            f"Erro ao obter preço do ativo {par}"
-                        )
-                        continue
+                    # --- Otimização aqui: buscar todos os dados em paralelo ---
+                    tasks = [api.get_price(p) for p in self.pares]
+                    tasks += [api.get_24h_ticker(p) for p in self.pares]
+                    tasks += [api.get_klines(p, "1d", 100) for p in self.pares]
+                    
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Separar os resultados
+                    num_pares = len(self.pares)
+                    precos = dict(zip(self.pares, results[0:num_pares]))
+                    tickers_24h = dict(zip(self.pares, results[num_pares:num_pares*2]))
+                    candles_data = dict(zip(self.pares, results[num_pares*2:num_pares*3]))
+                    # ---------------------------------------------------------
 
-                    # Atualizar histórico
-                    self.historico_precos[par].append(preco_atual)
-                    if len(self.historico_precos[par]) > 100:
-                        self.historico_precos[par].pop(0)
+                    for par in self.pares:
+                        preco_atual = precos.get(par)
+                        dados_24h = tickers_24h.get(par)
+                        candles = candles_data.get(par)
 
-                    # Obter médias móveis
-                    candles = get_daily_candles(par, limit=100)
-                    medias = calcular_medias_moveis(candles) if candles else None
+                        if not preco_atual or isinstance(preco_atual, Exception):
+                            print(f"⚠️ Erro ao obter preço de {par}: {preco_atual}")
+                            continue
 
-                    # Verificar stop loss / take profit primeiro
-                    if self.verificar_stop_loss_take_profit(preco_atual):
-                        continue
+                        # Atualizar histórico
+                        self.atualizar_dados_mercado(par, preco_atual, dados_24h.get('quoteVolume') if dados_24h and not isinstance(dados_24h, Exception) else None)
 
-                    # Selecionar estratégia para o par
-                    estrategia = self.estrategias.get(par, self.analisar_mercado)
-                    # Passa o par para a estratégia se ela aceitar
-                    try:
+                        # Obter médias móveis
+                        medias = calcular_medias_moveis(candles) if candles and not isinstance(candles, Exception) else None
+
+                        # Verificar stop loss / take profit primeiro
+                        if self.verificar_stop_loss_take_profit(preco_atual, par):
+                            continue
+
+                        # Selecionar estratégia para o par
+                        estrategia = self.estrategias.get(par, self.analisar_mercado)
                         decisao, motivo = estrategia(preco_atual, dados_24h, medias, par=par)
-                    except TypeError:
-                        decisao, motivo = estrategia(preco_atual, dados_24h, medias)
 
-                    # Exibir status
-                    self.exibir_status(preco_atual, dados_24h, medias, decisao, motivo)
+                        # Exibir status
+                        self.exibir_status(par, preco_atual, dados_24h, medias, decisao, motivo)
 
-                    # Executar trades (mais flexível em modo recuperação)
-                    modo_recuperacao = self.lucro_hoje < -0.01
-                    max_trades = MAX_TRADES_DIA + 2 if modo_recuperacao else MAX_TRADES_DIA
+                        # Executar trades
+                        modo_recuperacao = self.lucro_hoje < -0.01
+                        max_trades = MAX_TRADES_DIA + 2 if modo_recuperacao else MAX_TRADES_DIA
 
-                    if decisao == "COMPRA" and not self.posicao_aberta and self.trades_hoje < max_trades and self.capital >= 2.0:
-                        if modo_recuperacao:
-                            print(f"\n🔄 MODO RECUPERAÇÃO ATIVO - Trade {self.trades_hoje + 1}/{max_trades}")
-                        self.executar_compra(preco_atual)
-                    elif decisao == "VENDA" and self.posicao_aberta:
-                        self.executar_venda(preco_atual)
-                    elif decisao == "COMPRA" and self.capital < 2.0:
-                        print(f"\n⚠️ NÃO PODE COMPRAR: Saldo insuficiente (${self.capital:.2f})")
-                    elif decisao == "COMPRA" and self.trades_hoje >= max_trades:
-                        status = "RECUPERAÇÃO" if modo_recuperacao else "NORMAL"
-                        print(f"\n⚠️ LIMITE DE TRADES {status}: {self.trades_hoje}/{max_trades}")
+                        if decisao == "COMPRA" and not self.posicao_aberta.get(par, False) and self.trades_hoje < max_trades and self.capital >= 2.0:
+                            self.executar_compra(preco_atual, par, motivo)
+                        elif decisao == "VENDA" and self.posicao_aberta.get(par, False):
+                            self.executar_venda(preco_atual, par, motivo)
 
-                time.sleep(INTERVALO)
+                    await asyncio.sleep(INTERVALO)
 
-            except KeyboardInterrupt:
-                print("\n🛑 Bot interrompido pelo usuário")
-                break
-            except requests.exceptions.RequestException as e:
-                print(f"⚠️ Erro de conexão com a API: {e}")
-                self.log_manager.registrar_trade(
-                    "ERRO_CONEXAO", 0, 0, self.capital, self.lucro_hoje, (self.lucro_hoje/self.CAPITAL_INICIAL)*100,
-                    f"Erro de conexão: {e}"
-                )
-                time.sleep(INTERVALO * 2)
-            except Exception as e:
-                print(f"⚠️ Erro inesperado: {e}")
-                self.log_manager.registrar_trade(
-                    "ERRO_DESCONHECIDO", 0, 0, self.capital, self.lucro_hoje, (self.lucro_hoje/self.CAPITAL_INICIAL)*100,
-                    f"Erro inesperado: {e}"
-                )
-                time.sleep(INTERVALO)
+                except KeyboardInterrupt:
+                    print("\n🛑 Bot interrompido pelo usuário")
+                    break
+                except requests.exceptions.RequestException as e:
+                    print(f"⚠️ Erro de conexão com a API: {e}")
+                    self.db_manager.log("ERROR", "API", f"Erro de conexão: {e}")
+                    await asyncio.sleep(INTERVALO * 2)
+                except Exception as e:
+                    print(f"⚠️ Erro inesperado: {e}")
+                    self.db_manager.log("CRITICAL", "TradingBot", f"Erro inesperado no loop principal: {e}")
+                    await asyncio.sleep(INTERVALO)
 
 def main():
-    bot = TradingBot()
-    bot.run()
+    # Inicializar o bot com as configurações do config.py
+    bot = TradingBot(
+        pares=None,  # Usar os pares padrão do config.py ou os selecionados automaticamente
+        estrategias=None,  # Usar a estratégia padrão do config.py
+        capital_inicial=CAPITAL_INICIAL,
+        moeda_base=MOEDA_BASE,
+        usar_ml=USAR_ML,
+        usar_selecao_automatica=USAR_SELECAO_AUTOMATICA
+    )
+    asyncio.run(bot.run())
 
 if __name__ == "__main__":
     main()

@@ -23,3 +23,26 @@ STOP_LOSS_PCT = 0.02        # 2% stop loss (compensa taxas)
 TAKE_PROFIT_PCT = 0.05      # 5% take profit (lucro real após taxas)
 MAX_TRADES_DIA = 3          # Máximo 3 trades por dia (menos taxas)
 TAXA_BINANCE = 0.002        # 0.2% taxa total por trade completo
+
+# 🧠 Configurações de Machine Learning
+USAR_ML = True              # Ativa/desativa o uso de Machine Learning
+ML_CONFIANCA_MIN = 0.65     # Confiança mínima para considerar sinais ML (65%)
+ML_TREINO_INTERVALO = 3600  # Intervalo para retreinar modelos (em segundos)
+ML_MODELOS_DIR = "ml_models" # Diretório para salvar modelos treinados
+ML_FEATURES = [             # Features para usar no treinamento
+    "rsi", "macd", "ema_diff", "bollinger", "volume_change", 
+    "price_change", "volatility", "trend_strength"
+]
+ML_TIMEFRAMES = [           # Timeframes para análise multi-timeframe
+    "1m", "5m", "15m", "1h", "4h"
+]
+ML_JANELA_PREVISAO = 12     # Janela de previsão (em períodos)
+
+# 🔄 Configurações do Seletor Automático de Moedas
+USAR_SELECAO_AUTOMATICA = True  # Ativa/desativa a seleção automática de moedas
+SELECAO_INTERVALO = 3600 * 6    # Intervalo para buscar novas moedas (6 horas)
+SELECAO_MAX_MOEDAS = 5          # Número máximo de moedas para monitorar
+SELECAO_DIAS_NOVAS = 14         # Considerar moedas listadas nos últimos X dias
+SELECAO_VOLUME_MIN = 1000000    # Volume mínimo em USDT (1 milhão)
+SELECAO_VOLATILIDADE_MIN = 5.0  # Volatilidade mínima (5%)
+MOEDA_BASE = "USDT"            # Moeda base para negociação (ex: USDT, BUSD, BTC)
